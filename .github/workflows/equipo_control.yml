@@ -1,1 +1,52 @@
+name: "Ecosistema de Bots"
 
+# El BOT GERENTE se activa cuando subís código
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # BOT 1: CONTROL DE FUNCIONAMIENTO (Sintaxis)
+  bot-funcionamiento:
+    name: "Bot: Analista de Funcionamiento"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Verificar Sintaxis de Python
+        run: |
+          # Este bot revisa que no haya errores de tipeo o sintaxis en archivos .py
+          python -m compileall .
+
+  # BOT 2: AUDITOR DE SEGURIDAD
+  bot-seguridad:
+    name: "Bot: Auditor de Seguridad"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Escaneo de Seguridad (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+  # BOT 3: INGENIERO DE OPTIMIZACIÓN Y FORMATO
+  bot-optimizacion:
+    name: "Bot: Ingeniero de Optimización"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Analizar prolijidad del código (Super-Linter)
+        uses: super-linter/super-linter@v5
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
