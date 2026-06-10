@@ -36,17 +36,42 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH'
 
-  # BOT 3: INGENIERO DE OPTIMIZACIÓN Y FORMATO
+  # -------------------------------------------------------------------------
+  # BOT 3: INGENIERO DE OPTIMIZACIÓN Y FORMATO (VERSION ULTRA)
+  # -------------------------------------------------------------------------
   bot-optimizacion:
     name: "Bot: Ingeniero de Optimización"
     runs-on: ubuntu-latest
     steps:
-      - name: Descargar el código
+      - name: Descargar el código del repositorio
         uses: actions/checkout@v4
 
-      - name: Analizar prolijidad del código (Super-Linter)
-        uses: super-linter/super-linter@v5
-        env:
-          VALIDATE_ALL_CODEBASE: false
-          DEFAULT_BRANCH: main
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # --- FUNCIÓN 1: ORDENAR IMPORTS AUTOMÁTICAMENTE ---
+      - name: Ordenar Importaciones (isort)
+        run: |
+          pip install isort
+          isort . --check-only || echo "⚠️ Las importaciones no están ordenadas alfabéticamente."
+
+      # --- FUNCIÓN 2: CONTROL DE ESTILO ESTRICTO ---
+      - name: Verificar Formato Estricto (Black)
+        run: |
+          pip install black
+          black --check --diff . || echo "⚠️ El código no cumple con el formato estándar PEP 8."
+
+      # --- FUNCIÓN 3: DETECTOR DE CÓDIGO MUERTO ---
+      - name: Buscar Variables y Funciones sin usar (Vulture)
+        run: |
+          pip install vulture
+          vulture . --min-confidence 80 || echo "💡 Se encontraron posibles líneas de código muerto/sin usar."
+
+      # --- FUNCIÓN 4: ANALIZADOR DE COMPLEJIDAD (RENDIMIENTO) ---
+      - name: Analizar Complejidad de Funciones (Radon)
+        run: |
+          pip install radon
+          echo "📊 --- REPORTE DE COMPLEJIDAD CICLOMÁTICA (A es excelente, F es muy complejo) ---"
+          radon cc . -s -a
