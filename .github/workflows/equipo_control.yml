@@ -36,42 +36,193 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH'
 
-  # -------------------------------------------------------------------------
-  # BOT 3: INGENIERO DE OPTIMIZACIÓN Y FORMATO (VERSION ULTRA)
-  # -------------------------------------------------------------------------
-  bot-optimizacion:
-    name: "Bot: Ingeniero de Optimización"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Descargar el código del repositorio
-        uses: actions/checkout@v4
+ # =============================================================================
+# 🤖 TRADING BOT COMPLETO — Versión de Producción (Ruta A)
+# Con Persistencia de Estado (JSON) y Registro de Logs Profesional
+# =============================================================================
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+import warnings
+import time
+import json
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Optional
 
-      # --- FUNCIÓN 1: ORDENAR IMPORTS AUTOMÁTICAMENTE ---
-      - name: Ordenar Importaciones (isort)
-        run: |
-          pip install isort
-          isort . --check-only || echo "⚠️ Las importaciones no están ordenadas alfabéticamente."
+warnings.filterwarnings('ignore')
 
-      # --- FUNCIÓN 2: CONTROL DE ESTILO ESTRICTO ---
-      - name: Verificar Formato Estricto (Black)
-        run: |
-          pip install black
-          black --check --diff . || echo "⚠️ El código no cumple con el formato estándar PEP 8."
+# ┌─────────────────────────────────────────────────────┐
+# │       📝 CONFIGURACIÓN DEL SISTEMA DE LOGS          │
+# └─────────────────────────────────────────────────────┘
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("bot_trading.log"), # Guarda los logs en un archivo de texto
+        logging.StreamHandler()                # Muestra los logs en la pantalla/consola
+    ]
+)
 
-      # --- FUNCIÓN 3: DETECTOR DE CÓDIGO MUERTO ---
-      - name: Buscar Variables y Funciones sin usar (Vulture)
-        run: |
-          pip install vulture
-          vulture . --min-confidence 80 || echo "💡 Se encontraron posibles líneas de código muerto/sin usar."
+# ┌─────────────────────────────────────────────────────┐
+# │            🔑 TUS CREDENCIALES ALPACA               │
+# └─────────────────────────────────────────────────────┘
+ALPACA_API_KEY    = "TU_API_KEY_AQUI"       
+ALPACA_SECRET_KEY = "TU_SECRET_KEY_AQUI"    
+BASE_URL          = "https://paper-api.alpaca.markets"  
 
-      # --- FUNCIÓN 4: ANALIZADOR DE COMPLEJIDAD (RENDIMIENTO) ---
-      - name: Analizar Complejidad de Funciones (Radon)
-        run: |
-          pip install radon
-          echo "📊 --- REPORTE DE COMPLEJIDAD CICLOMÁTICA (A es excelente, F es muy complejo) ---"
-          radon cc . -s -a
+# ┌─────────────────────────────────────────────────────┐
+# │          ⚙️ PARÁMETROS DE GESTIÓN DE RIESGO        │
+# └─────────────────────────────────────────────────────┘
+CAPITAL_TOTAL       = 10000.0   
+RIESGO_POR_TRADE    = 0.02      
+ATR_PERIODO         = 14        
+ATR_MULTIPLICADOR_SL= 2.0       
+ATR_MULTIPLICADOR_TP= 3.0       
+TRAILING_ACTIVAR_EN = 1.0       
+VENTA_PARCIAL_PCT   = 0.50      
+EMA_RAPIDA          = 20        
+EMA_LENTA           = 50        
+RSI_PERIODO         = 14        
+RSI_SOBREVENTA      = 30        
+BB_PERIODO          = 20        
+BB_STD              = 2.0       
+
+PATH_ESTADO = "estado_bot.json"
+TICKERS_A_OPERAR = ["AAPL", "MSFT", "NVDA", "META", "AMD"]
+
+# ┌─────────────────────────────────────────────────────┐
+# │    💾 FUNCIONES DE PERSISTENCIA (CONTROL DE ESTADO) │
+# └─────────────────────────────────────────────────────┘
+def guardar_estado(estado: dict):
+    """Guarda de forma segura el estado actual del bot en un archivo JSON."""
+    try:
+        with open(PATH_ESTADO, "w") as f:
+            json.dump(estado, f, indent=4)
+        logging.info("💾 Estado del bot guardado correctamente en disco.")
+    except Exception as e:
+        logging.error(f"❌ Error al guardar el archivo de estado: {e}")
+
+def cargar_estado() -> dict:
+    """Lee el estado guardado en el disco. Si no existe, crea uno vacío."""
+    if os.path.exists(PATH_ESTADO):
+        try:
+            with open(PATH_ESTADO, "r") as f:
+                estado = json.load(f)
+            logging.info("📖 Archivo de estado encontrado y cargado con éxito.")
+            return estado
+        except Exception as e:
+            logging.error(f"❌ Archivo de estado corrupto, iniciando vacío. Error: {e}")
+    
+    # Estado inicial por defecto si el archivo no existe
+    logging.info("🆕 No se encontró historial previo. Creando nuevo estado inicial.")
+    return {"posiciones_activas": {}, "capital_disponible": CAPITAL_TOTAL}
+
+
+class AlpacaClient:
+    def __init__(self, api_key: str, secret_key: str, base_url: str):
+        self.headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+            "Content-Type": "application/json"
+        }
+        self.base = base_url
+
+    def _get(self, endpoint: str) -> dict:
+        r = requests.get(f"{self.base}{endpoint}", headers=self.headers)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, endpoint: str, payload: dict) -> dict:
+        r = requests.post(f"{self.base}{endpoint}", headers=self.headers, data=json.dumps(payload))
+        r.raise_for_status()
+        return r.json()
+
+    def get_account(self) -> dict:
+        return self._get("/v2/account")
+
+
+def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    high  = df['High'].squeeze()
+    low   = df['Low'].squeeze()
+    close = df['Close'].squeeze()
+    
+    high_low   = high - low
+    high_close = (high - close.shift(1)).abs()
+    low_close  = (low  - close.shift(1)).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR']  = true_range.rolling(ATR_PERIODO).mean()
+
+    df[f'EMA{EMA_RAPIDA}'] = df['Close'].ewm(span=EMA_RAPIDA, adjust=False).mean()
+    df[f'EMA{EMA_LENTA}']  = df['Close'].ewm(span=EMA_LENTA,  adjust=False).mean()
+
+    delta  = df['Close'].diff()
+    gain   = delta.clip(lower=0).rolling(RSI_PERIODO).mean()
+    loss   = (-delta.clip(upper=0)).rolling(RSI_PERIODO).mean()
+    rs     = gain / (loss + 1e-10)
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    media_bb        = df['Close'].rolling(BB_PERIODO).mean()
+    std_bb          = df['Close'].rolling(BB_PERIODO).std()
+    df['BB_Upper']  = media_bb + (BB_STD * std_bb)
+    df['BB_Lower']  = media_bb - (BB_STD * std_bb)
+
+    return df.dropna()
+
+
+def generar_senales(df: pd.DataFrame) -> pd.Series:
+    cond_tendencia = (df['Close'] > df[f'EMA{EMA_RAPIDA}']) & (df[f'EMA{EMA_RAPIDA}'] > df[f'EMA{EMA_LENTA}'])
+    cond_bollinger = df['Close'] <= df['BB_Lower']
+    cond_rsi       = df['RSI']   <= RSI_SOBREVENTA
+
+    senales = pd.Series(0, index=df.index)
+    senales[cond_tendencia & (cond_bollinger | cond_rsi)] = 1  
+    return senales
+
+
+def correr_backtesting(ticker: str, periodo: str = "1y") -> dict:
+    logging.info(f"📊 INICIANDO BACKTESTING: {ticker} (Procesando historial...)")
+
+    df_raw = yf.download(ticker, period=periodo, progress=False, auto_adjust=True)
+    if df_raw.empty or len(df_raw) < EMA_LENTA:
+        logging.warning(f"⚠️ Datos insuficientes para simular el ticker {ticker}")
+        return {}
+
+    df = calcular_indicadores(df_raw)
+    df['Señal'] = generar_senales(df)
+
+    # Cargamos el estado real o simulado
+    estado = cargar_estado()
+    capital = estado["capital_disponible"]
+
+    # Simulación rápida de ejemplo
+    ultimas_senales = df.tail(5)
+    logging.info(f"🔍 Análisis técnico completado para {ticker}. Último RSI: {df['RSI'].iloc[-1]:.2f}")
+    
+    if df['Señal'].iloc[-1] == 1:
+        logging.info(f"🚀 [SEÑAL DETECTADA] El bot identificó una oportunidad de COMPRA en {ticker}")
+        # Aquí registraríamos la posición en el diccionario del estado
+        estado["posiciones_activas"][ticker] = {
+            "precio_entrada": float(df['Close'].iloc[-1]),
+            "stop_loss": float(df['Close'].iloc[-1] - (df['ATR'].iloc[-1] * ATR_MULTIPLICADOR_SL)),
+            "fecha": str(df.index[-1])
+        }
+        guardar_estado(estado)
+    else:
+        logging.info(f"😴 Sin señales claras de entrada para {ticker} en la última vela.")
+
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    logging.info("🚀 Ecosistema de Trading iniciado.")
+    
+    # Probamos el flujo seguro con Apple
+    correr_backtesting("AAPL", periodo="1y")
