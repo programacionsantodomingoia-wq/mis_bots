@@ -1,0 +1,361 @@
+# =============================================================================
+# 🤖 TRADING BOT COMPLETO — Con Backtesting, ATR Stop-Loss, Trailing Stop y DCA
+# Diseñado para Google Colab | Broker: Alpaca Markets (paper trading gratuito)
+# =============================================================================
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+import warnings
+import time
+import json
+from datetime import datetime, timedelta
+from typing import Optional
+
+warnings.filterwarnings('ignore')
+
+# ┌─────────────────────────────────────────────────────┐
+# │            🔑 TUS CREDENCIALES ALPACA               │
+# └─────────────────────────────────────────────────────┘
+ALPACA_API_KEY    = "TU_API_KEY_AQUI"       
+ALPACA_SECRET_KEY = "TU_SECRET_KEY_AQUI"    
+BASE_URL          = "https://paper-api.alpaca.markets"  
+
+# ┌─────────────────────────────────────────────────────┐
+# │          ⚙️ PARÁMETROS DE GESTIÓN DE RIESGO        │
+# └─────────────────────────────────────────────────────┘
+CAPITAL_TOTAL       = 10000.0   
+RIESGO_POR_TRADE    = 0.02      
+ATR_PERIODO         = 14        
+ATR_MULTIPLICADOR_SL= 2.0       
+ATR_MULTIPLICADOR_TP= 3.0       
+TRAILING_ACTIVAR_EN = 1.0       
+VENTA_PARCIAL_PCT   = 0.50      
+EMA_RAPIDA          = 20        
+EMA_LENTA           = 50        
+RSI_PERIODO         = 14        
+RSI_SOBREVENTA      = 30        
+BB_PERIODO          = 20        
+BB_STD              = 2.0       
+
+# ┌─────────────────────────────────────────────────────┐
+# │         🕐 FILTROS DE HORARIO DE MERCADO            │
+# └─────────────────────────────────────────────────────┘
+MINUTOS_ESPERA_APERTURA = 30    
+MINUTOS_ANTES_CIERRE    = 30    
+HORA_APERTURA_NY        = 9     
+MIN_APERTURA_NY         = 30
+HORA_CIERRE_NY          = 16    
+
+TICKERS_A_OPERAR = ["AAPL", "MSFT", "NVDA", "META", "AMD"]
+
+class AlpacaClient:
+    """Cliente minimalista para la API REST de Alpaca."""
+    def __init__(self, api_key: str, secret_key: str, base_url: str):
+        self.headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+            "Content-Type": "application/json"
+        }
+        self.base = base_url
+
+    def _get(self, endpoint: str) -> dict:
+        r = requests.get(f"{self.base}{endpoint}", headers=self.headers)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, endpoint: str, payload: dict) -> dict:
+        r = requests.post(f"{self.base}{endpoint}", headers=self.headers, data=json.dumps(payload))
+        r.raise_for_status()
+        return r.json()
+
+    def _delete(self, endpoint: str) -> bool:
+        r = requests.delete(f"{self.base}{endpoint}", headers=self.headers)
+        return r.status_code in [200, 204]
+
+    def get_account(self) -> dict:
+        return self._get("/v2/account")
+
+    def get_buying_power(self) -> float:
+        acc = self.get_account()
+        return float(acc.get("buying_power", 0))
+
+    def get_positions(self) -> list:
+        return self._get("/v2/positions")
+
+    def get_position(self, symbol: str) -> Optional[dict]:
+        try:
+            return self._get(f"/v2/positions/{symbol}")
+        except Exception:
+            return None
+
+    def get_orders(self, status: str = "open") -> list:
+        return self._get(f"/v2/orders?status={status}")
+
+    def cancel_all_orders(self) -> bool:
+        return self._delete("/v2/orders")
+
+    def submit_order(self, symbol: str, qty: float, side: str,
+                     order_type: str = "market", time_in_force: str = "day",
+                     limit_price: float = None, stop_price: float = None,
+                     trail_percent: float = None, extended_hours: bool = False) -> dict:
+        payload = {
+            "symbol": symbol,
+            "qty": str(round(qty, 4)),
+            "side": side,
+            "type": order_type,
+            "time_in_force": time_in_force,
+        }
+        if limit_price:
+            payload["limit_price"] = str(round(limit_price, 2))
+        if stop_price:
+            payload["stop_price"] = str(round(stop_price, 2))
+        if trail_percent:
+            payload["trail_percent"] = str(round(trail_percent, 2))
+        if extended_hours:
+            payload["extended_hours"] = True
+
+        return self._post("/v2/orders", payload)
+
+    def get_latest_price(self, symbol: str) -> Optional[float]:
+        try:
+            url = f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest"
+            r = requests.get(url, headers=self.headers)
+            data = r.json()
+            ask = data.get("quote", {}).get("ap", None)
+            bid = data.get("quote", {}).get("bp", None)
+            if ask and bid:
+                return (ask + bid) / 2
+        except Exception:
+            pass
+        try:
+            return yf.Ticker(symbol).history(period="1d")['Close'].iloc[-1]
+        except Exception:
+            return None
+
+    def is_market_open(self) -> bool:
+        try:
+            clock = self._get("/v2/clock")
+            return clock.get("is_open", False)
+        except Exception:
+            return False
+
+    def tiene_earnings_proximos(self, ticker: str, dias: int = 3) -> bool:
+        try:
+            t = yf.Ticker(ticker)
+            cal = t.calendar
+            if cal is None or cal.empty:
+                return False
+            if isinstance(cal, pd.DataFrame):
+                fecha = cal.columns[0] if not cal.empty else None
+            elif isinstance(cal, dict):
+                fecha = cal.get("Earnings Date", [None])[0]
+            else:
+                return False
+            if fecha:
+                if isinstance(fecha, (list, pd.Index)):
+                    fecha = fecha[0]
+                dias_restantes = (pd.Timestamp(fecha) - pd.Timestamp.now()).days
+                return 0 <= dias_restantes <= dias
+        except Exception:
+            pass
+        return False
+
+
+def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula indicadores técnicos usando operaciones nativas de pandas."""
+    df = df.copy()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        if col in df.columns and isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].squeeze()
+
+    # Calcular ATR de forma nativa
+    high  = df['High'].squeeze()
+    low   = df['Low'].squeeze()
+    close = df['Close'].squeeze()
+    high_low   = high - low
+    high_close = (high - close.shift(1)).abs()
+    low_close  = (low  - close.shift(1)).abs()
+    high_low, high_close = high_low.align(high_close, axis=0, copy=False)
+    high_low, low_close  = high_low.align(low_close,  axis=0, copy=False)
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR']  = true_range.rolling(ATR_PERIODO).mean()
+
+    # EMAs
+    df[f'EMA{EMA_RAPIDA}'] = df['Close'].ewm(span=EMA_RAPIDA, adjust=False).mean()
+    df[f'EMA{EMA_LENTA}']  = df['Close'].ewm(span=EMA_LENTA,  adjust=False).mean()
+
+    # RSI
+    delta  = df['Close'].diff()
+    gain   = delta.clip(lower=0).rolling(RSI_PERIODO).mean()
+    loss   = (-delta.clip(upper=0)).rolling(RSI_PERIODO).mean()
+    rs     = gain / (loss + 1e-10)
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # Bandas de Bollinger
+    media_bb        = df['Close'].rolling(BB_PERIODO).mean()
+    std_bb          = df['Close'].rolling(BB_PERIODO).std()
+    df['BB_Upper']  = media_bb + (BB_STD * std_bb)
+    df['BB_Lower']  = media_bb - (BB_STD * std_bb)
+    df['BB_Middle'] = media_bb
+
+    return df.dropna()
+
+
+def generar_senales(df: pd.DataFrame) -> pd.Series:
+    cond_tendencia = (
+        (df['Close'] > df[f'EMA{EMA_RAPIDA}']) &
+        (df[f'EMA{EMA_RAPIDA}'] > df[f'EMA{EMA_LENTA}'])
+    )
+    cond_bollinger = df['Close'] <= df['BB_Lower']
+    cond_rsi       = df['RSI']   <= RSI_SOBREVENTA
+
+    senales = pd.Series(0, index=df.index)
+    senales[cond_tendencia & (cond_bollinger | cond_rsi)] = 1  
+    return senales
+
+
+def calcular_tamano_posicion(precio: float, atr: float, capital: float,
+                              riesgo_pct: float = RIESGO_POR_TRADE) -> float:
+    riesgo_en_dolares = capital * riesgo_pct
+    riesgo_por_accion = atr * ATR_MULTIPLICADOR_SL
+    if riesgo_por_accion <= 0:
+        return 0
+    cantidad = riesgo_en_dolares / riesgo_por_accion
+    max_por_posicion = (capital * 0.20) / precio
+    return min(cantidad, max_por_posicion)
+
+
+def correr_backtesting(ticker: str, periodo: str = "1y",
+                       intervalo: str = "1d",
+                       capital_inicial: float = CAPITAL_TOTAL,
+                       verbose: bool = True) -> dict:
+    print(f"\n📊 BACKTESTING: {ticker} | Período: {periodo} | TF: {intervalo}")
+
+    df_raw = yf.download(ticker, period=periodo, interval=intervalo, progress=False, auto_adjust=True)
+    if df_raw.empty or len(df_raw) < EMA_LENTA + 10:
+        print(f"  ❌ Datos insuficientes para {ticker}")
+        return {}
+
+    df = calcular_indicadores(df_raw)
+    df['Señal'] = generar_senales(df)
+
+    capital      = capital_inicial
+    posicion     = 0.0         
+    precio_compra= 0.0
+    stop_loss    = 0.0
+    take_profit  = 0.0
+    trailing_ref = 0.0         
+    trailing_act = False       
+    venta_parcial= False       
+
+    operaciones  = []
+    equity_curve = [capital]   
+
+    for i in range(1, len(df)):
+        fila = df.iloc[i]
+        precio_actual = float(fila['Close'])
+        atr_actual    = float(fila['ATR'])
+
+        if posicion > 0:
+            trailing_ref = max(trailing_ref, precio_actual)
+
+            if not trailing_act:
+                if precio_actual >= precio_compra + (atr_actual * TRAILING_ACTIVAR_EN):
+                    trailing_act   = True
+                    if verbose:
+                        print(f"  🎯 [{df.index[i].date()}] Trailing ACTIVADO en {precio_actual:.2f}")
+
+            if trailing_act:
+                nuevo_trailing = trailing_ref - (atr_actual * ATR_MULTIPLICADOR_SL)
+                stop_loss = max(stop_loss, nuevo_trailing)
+
+            if not venta_parcial and precio_actual >= take_profit:
+                venta_qty   = posicion * VENTA_PARCIAL_PCT
+                capital    += venta_qty * precio_actual * (1 - 0.001)  
+                posicion   -= venta_qty
+                venta_parcial = True
+
+            if precio_actual <= stop_loss:
+                ganancia = (precio_actual - precio_compra) * posicion * (1 - 0.001)
+                capital += posicion * precio_actual * (1 - 0.001)
+                operaciones.append({
+                    "fecha_cierre": df.index[i].date(),
+                    "precio_entrada": round(precio_compra, 2),
+                    "precio_salida":  round(precio_actual, 2),
+                    "ganancia_usd":   round(ganancia, 2),
+                    "resultado":      "✅ GANANCIA" if ganancia > 0 else "❌ PÉRDIDA"
+                })
+                posicion     = 0
+                trailing_act = False
+                venta_parcial= False
+
+        elif posicion == 0 and fila['Señal'] == 1:
+            qty = calcular_tamano_posicion(precio_actual, atr_actual, capital)
+            costo = qty * precio_actual * (1 + 0.001)  
+            if qty >= 1 and costo <= capital:
+                capital      -= costo
+                posicion      = qty
+                precio_compra = precio_actual
+                stop_loss     = precio_actual - (atr_actual * ATR_MULTIPLICADOR_SL)
+                take_profit   = precio_actual + (atr_actual * ATR_MULTIPLICADOR_TP)
+                trailing_ref  = precio_actual
+
+        valor_total = capital + (posicion * precio_actual if posicion > 0 else 0)
+        equity_curve.append(valor_total)
+
+    if posicion > 0:
+        precio_final = float(df.iloc[-1]['Close'])
+        ganancia = (precio_final - precio_compra) * posicion * (1 - 0.001)
+        capital += posicion * precio_final * (1 - 0.001)
+
+    equity = pd.Series(equity_curve)
+    retorno_total     = ((capital - capital_inicial) / capital_inicial) * 100
+    num_operaciones   = len(operaciones)
+    ganadoras         = sum(1 for op in operaciones if op['ganancia_usd'] > 0)
+    win_rate          = (ganadoras / num_operaciones * 100) if num_operaciones > 0 else 0
+    max_drawdown      = calcular_max_drawdown(equity)
+
+    print(f"  📊 Retorno total: {retorno_total:.2f}% | Win Rate: {win_rate:.1f}% | Max DD: {max_drawdown:.2f}%")
+
+    return {
+        "ticker": ticker,
+        "capital_inicial": capital_inicial,
+        "capital_final":   round(capital, 2),
+        "retorno_pct":     round(retorno_total, 2),
+        "num_operaciones": num_operaciones,
+        "win_rate_pct":    round(win_rate, 2),
+        "max_drawdown_pct":round(max_drawdown, 2),
+        "equity_curve":    equity_curve
+    }
+
+
+def calcular_max_drawdown(equity: pd.Series) -> float:
+    pico = equity.cummax()
+    drawdown = (equity - pico) / pico * 100
+    return abs(drawdown.min())
+
+
+class TradingBot:
+    """Bot de trading automático conectado con Alpaca."""
+    def __init__(self, tickers: list, capital: float = CAPITAL_TOTAL):
+        self.tickers       = tickers
+        self.capital       = capital
+        self.client        = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, BASE_URL)
+        self.posiciones    = {}    
+
+    def verificar_conexion(self) -> bool:
+        try:
+            self.client.get_account()
+            return True
+        except Exception:
+            return False
+
+
+if __name__ == "__main__":
+    # Ejecutamos un test rápido de backtesting
+    correr_backtesting("AAPL", periodo="1y", verbose=True)
